@@ -50,11 +50,3 @@ def query_handler(question):
     "msg": "查询失败，没有匹配的问句模版"
   }
 
-if __name__ == "__main__":
-  query_handler('歌曲兰亭序所属的音乐专辑是')
-  query_handler('歌曲兰亭序的作词人是')
-  query_handler('演唱兰亭序的歌手是')
-  query_handler('专辑魔杰座包含的歌曲是')
-  query_handler('周杰伦演唱的歌曲有')
-  query_handler('方文山作词的歌曲有')
-  query_handler('周杰伦合作过的人有')
