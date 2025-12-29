@@ -1,129 +1,64 @@
 # back_end/two_stage.py
 from llm import call_llm
-from handler import query_handler
-from entity_extractor import get_entity_extractor
+from handler import query_handler, get_relation_type_from_question, extract_head_entity  # ← 新增导入
+from entity_extractor import extract_triples_from_llm_answer
+import re
 
 
 def two_stage_qa(question: str):
-    """
-    两阶段问答系统：
-    1. 第一阶段：LLM生成答案
-    2. 第二阶段：从LLM回答中抽取实体，与知识图谱结果进行比对验证
-    """
-    # === 第一阶段：LLM 生成 ===
+    # ========== 阶段1：LLM 原始回答 ==========
     llm_ans = call_llm(question)
-    print(f"【第一阶段】已接入千问2.5 1.5b，大模型的回答是：{llm_ans}")
+    print(f"【阶段1 - LLM原始回答】: {llm_ans}")
 
-    # === 第二阶段：尝试用 KG 验证 ===
+    # ========== 阶段2：从 LLM 回答中抽取三元组 ==========
+    llm_triples = extract_triples_from_llm_answer(llm_ans, question)
+    print(f"【阶段2 - 抽取三元组】: {llm_triples}")
+
+    # ========== 阶段3：查询知识库 ==========
     kg_res = query_handler(question)
-    
-    # 获取实体抽取器
-    extractor = get_entity_extractor()
-    
-    # 从LLM回答中抽取实体
-    llm_entities = extractor.extract_entities(llm_ans)
-    llm_all_entities = extractor.extract_all_entities(llm_ans)
-    print(f"【实体抽取】从LLM回答中抽取到实体: {llm_all_entities}")
-    print(f"  歌曲: {llm_entities['songs']}")
-    print(f"  专辑: {llm_entities['albums']}")
-    print(f"  人物: {llm_entities['persons']}")
+    kg_answers = kg_res["data"] if kg_res["state"] == 0 and kg_res["data"] else []
+    print(f"【阶段3 - KG查询结果】: {kg_answers}")
 
-    if kg_res["state"] == 0 and kg_res["data"]:
-        kg_answers = kg_res["data"]
-        kg_set = set(kg_answers)
-        
-        # 方法1: 原始字符串匹配（保留兼容性）
-        if llm_ans in kg_set:
-            return {
-                "final_answer": llm_ans,
-                "source": "verified_by_kg_string",
-                "llm_answer": llm_ans,
-                "kg_answers": kg_answers,
-                "llm_entities": llm_entities,
-                "is_hallucination": False,
-                "match_type": "string_match"
-            }
-        
-        # 方法2: 实体级别匹配 - 检查LLM回答中的实体是否与KG结果有交集
-        if llm_all_entities:
-            # 检查LLM抽取的实体是否在KG结果中
-            llm_entity_set = set(llm_all_entities)
-            kg_set_lower = {str(item).lower() for item in kg_set}
-            llm_entity_set_lower = {str(item).lower() for item in llm_entity_set}
-            
-            matched_entities = llm_entity_set_lower & kg_set_lower
-            
-            if matched_entities:
-                # 找到匹配的实体，使用KG结果
-                # 优先使用与匹配实体最接近的KG答案
-                matched_entity_original = None
-                for llm_ent in llm_entity_set:
-                    if llm_ent.lower() in matched_entities:
-                        matched_entity_original = llm_ent
-                        break
-                
-                # 如果KG结果包含匹配的实体，直接使用
-                for kg_ans in kg_answers:
-                    if str(kg_ans).lower() in matched_entities or matched_entity_original in str(kg_ans):
-                        print(f"【实体匹配成功】LLM实体 '{matched_entity_original}' 与KG结果 '{kg_ans}' 匹配")
-                        return {
-                            "final_answer": kg_ans,
-                            "source": "verified_by_kg_entity",
-                            "llm_answer": llm_ans,
-                            "kg_answers": kg_answers,
-                            "llm_entities": llm_entities,
-                            "matched_entities": list(matched_entities),
-                            "is_hallucination": False,
-                            "match_type": "entity_match"
-                        }
-                
-                # 如果匹配到实体但格式不完全一致，使用KG第一个结果
-                correct = kg_answers[0]
-                print(f"【实体部分匹配】LLM实体 '{list(matched_entities)[0]}' 与KG相关，使用KG答案 '{correct}' 修正")
-                return {
-                    "final_answer": correct,
-                    "source": "corrected_by_kg_entity",
-                    "llm_answer": llm_ans,
-                    "kg_answers": kg_answers,
-                    "llm_entities": llm_entities,
-                    "matched_entities": list(matched_entities),
-                    "is_hallucination": True,
-                    "match_type": "entity_partial_match"
-                }
-            else:
-                # LLM抽取了实体，但与KG结果不匹配，可能存在幻觉
-                correct = kg_answers[0]
-                print(f"【实体不匹配】LLM回答中的实体 {llm_all_entities} 与KG结果 {kg_answers} 不匹配，使用KG答案 '{correct}' 修正")
-                return {
-                    "final_answer": correct,
-                    "source": "corrected_by_kg_entity",
-                    "llm_answer": llm_ans,
-                    "kg_answers": kg_answers,
-                    "llm_entities": llm_entities,
-                    "is_hallucination": True,
-                    "match_type": "entity_mismatch"
-                }
-        else:
-            # LLM回答中未提取到实体，使用KG结果修正
-            correct = kg_answers[0]
-            print(f"【未提取到实体】LLM回答中未找到已知实体，使用KG答案 '{correct}' 修正")
-            return {
-                "final_answer": correct,
-                "source": "corrected_by_kg",
-                "llm_answer": llm_ans,
-                "kg_answers": kg_answers,
-                "llm_entities": llm_entities,
-                "is_hallucination": True,
-                "match_type": "no_entity_extracted"
-            }
+    # ✅ 关键修复：使用与 query_handler 完全一致的实体提取方式！
+    head_entity = extract_head_entity(question)
+    rel = get_relation_type_from_question(question)
+
+    # 对于前3种查询（歌曲→专辑/作词/歌手），head 就是歌曲名
+    # 后4种是反向查询（人物/专辑→歌曲），此时不构造 (head, rel, tail) 三元组（或需调整）
+    # 当前我们只处理正向关系（rel in {"歌手", "作词", "作曲"}）
+    if rel in {"歌手", "作词", "作曲"} and head_entity and kg_answers:
+        kg_triples = [(head_entity, rel, ans) for ans in kg_answers]
     else:
-        # KG查询失败，返回LLM答案（无法验证）
-        return {
-            "final_answer": llm_ans,
-            "source": "unverified_llm",
-            "llm_answer": llm_ans,
-            "kg_answers": [],
-            "llm_entities": llm_entities,
-            "is_hallucination": None,
-            "match_type": "kg_query_failed"
-        }
+        kg_triples = []
+
+    print(f"【阶段3 - KG三元组】: {kg_triples}")
+
+    # ========== 阶段4：匹配验证 ==========
+    match_result = False
+    if kg_triples and llm_triples:
+        match_result = any(triple in kg_triples for triple in llm_triples)
+
+    if match_result:
+        final_answer = llm_ans
+        print("【阶段4 - 匹配验证】: 匹配成功 → LLM回答正确")
+    elif kg_answers:
+        final_answer = ", ".join(kg_answers)
+        print("【阶段4 - 匹配验证】: 匹配失败 → 使用KG事实修正答案")
+    else:
+        final_answer = llm_ans if llm_ans.strip() not in {"", "未知"} else "未找到相关信息"
+        print("【阶段4 - 匹配验证】: 无法验证（KG无相关事实）")
+
+    print(f"【最终答案】: {final_answer}")
+    print("-" * 60)
+
+    return {
+        "final_answer": final_answer,
+        "is_hallucination": (not match_result) and bool(kg_answers),
+        "source": "verified_by_kg_triple" if match_result else ("corrected_by_kg" if kg_answers else "llm_unverified"),
+        "stage_1_llm_raw": llm_ans,
+        "stage_2_extracted_triples": [list(t) for t in llm_triples],
+        "stage_3_kg_triples": [list(t) for t in kg_triples],
+        "stage_4_match_result": match_result,
+        "kg_answers": kg_answers,
+        "llm_answer": llm_ans,
+    }
