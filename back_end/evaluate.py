@@ -1,154 +1,168 @@
+# evaluate.py
+import json
 import re
-import sys
-from pathlib import Path
+import csv
+from collections import defaultdict
+from handler import query_handler
+from typing import List
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+with open("test_cases.json", "r", encoding="utf-8") as f:
+    TEST_CASES = json.load(f)
 
-from two_stage import two_stage_qa
+def normalize_answer(text: str) -> set:
+    if not text:
+        return set()
+    text = re.sub(r'[^\w\s]', ' ', text.lower())
+    return set(text.split())
 
-SUPPORTED_RELS = {"歌手", "作词", "作曲"}
+def answer_f1(pred: str, gold: List[str]) -> float:
+    pred_tokens = normalize_answer(pred)
+    gold_tokens = normalize_answer(" ".join(gold))
+    if not gold_tokens:
+        return 1.0 if not pred_tokens else 0.0
+    if not pred_tokens:
+        return 0.0
+    common = pred_tokens & gold_tokens
+    precision = len(common) / len(pred_tokens)
+    recall = len(common) / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
 
-TEST_CASES = [
-    {
-        "question": "七里香是谁唱的？",
-        "keywords": ["周杰伦"],
-        "expected_triples": [("七里香", "歌手", "周杰伦")]
-    },
-    {
-        "question": "青花瓷的作词人是谁？",
-        "keywords": ["方文山"],
-        "expected_triples": [("青花瓷", "作词", "方文山")]
-    },
-    {
-        "question": "周杰伦演唱过什么歌曲？",
-        "keywords": ["七里香", "青花瓷", "双截棍"],
-        "expected_triples": []
-    },
-    {
-        "question": "夜曲的作曲是谁？",
-        "keywords": ["周杰伦"],
-        "expected_triples": [("夜曲", "作曲", "周杰伦")]
-    },
-    {
-        "question": "发如雪收录在哪张专辑？",
-        "keywords": ["十一月的肖邦"],
-        "expected_triples": [("发如雪", "所属专辑", "十一月的肖邦")]
-    }
-]
+def classify_error(question: str, golden: List[str], system_pred: List[str], matched: bool) -> str:
+    if not matched:
+        return "pattern_mismatch"
+    if not system_pred:
+        return "kg_missing"  # KG 中无此三元组
+    if set(system_pred) == set(golden):
+        return "correct"
+    return "wrong_retrieval"
 
-
-def normalize_text(text: str) -> str:
-    if text is None:
-        return ""
-    text = str(text)
-    text = re.sub(r"\s+", "", text)
-    return text.strip(" ,，。.!！？?;；:：\"'“”‘’（）()[]【】《》")
-
-
-def answer_contains_any(answer: str, keywords) -> bool:
-    if not keywords:
-        return False
-    normalized_answer = normalize_text(answer)
-    return any(normalize_text(k) in normalized_answer for k in keywords)
-
-
-def normalize_triples(triples):
-    normalized = set()
-    for triple in triples:
-        if len(triple) != 3:
-            continue
-        head, rel, tail = triple
-        normalized.add((normalize_text(head), normalize_text(rel), normalize_text(tail)))
-    return normalized
-
-
-def calculate_metrics(results):
-    total = len(results)
-    correct_count = 0
-    correct_total = 0
-    hallucination_detected_count = 0
-    kg_usage_count = 0
-
-    tp_triples = 0
-    fp_triples = 0
-    fn_triples = 0
-    triple_cases = 0
-
-    print(f"\n{'='*20} EVALUATION REPORT {'='*20}")
-
-    for res in results:
-        q = res["question"]
-        final_ans = res["result"].get("final_answer", "")
-        is_hallucination = res["result"].get("is_hallucination")
-        extracted_raw = res["result"].get("stage_2_extracted_triples", [])
-        extracted_triples = normalize_triples([tuple(t) for t in extracted_raw])
-
-        is_correct = answer_contains_any(final_ans, res["keywords"])
-        if res["keywords"]:
-            correct_total += 1
-            if is_correct:
-                correct_count += 1
-
-        if is_hallucination:
-            hallucination_detected_count += 1
-
-        if res["result"].get("source") in ["corrected_by_kg", "verified_by_kg_triple"]:
-            kg_usage_count += 1
-
-        expected = [t for t in res["expected_triples"] if t[1] in SUPPORTED_RELS]
-        expected_triples = normalize_triples(expected)
-
-        if expected_triples:
-            triple_cases += 1
-            tp = len(extracted_triples & expected_triples)
-            fp = len(extracted_triples - expected_triples)
-            fn = len(expected_triples - extracted_triples)
-            tp_triples += tp
-            fp_triples += fp
-            fn_triples += fn
-
-        print(f"Q: {q}")
-        print(f"  Ans: {final_ans}")
-        print(f"  Correct: {is_correct}")
-        print(f"  Extracted: {extracted_triples}")
-        print(f"  Expected: {expected_triples}")
-        print(f"  Source: {res['result'].get('source')}")
-        print(f"  Match Result: {res['result'].get('stage_4_match_result')}")
-        print("-" * 30)
-
-    precision = tp_triples / (tp_triples + fp_triples) if (tp_triples + fp_triples) > 0 else 0
-    recall = tp_triples / (tp_triples + fn_triples) if (tp_triples + fn_triples) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-
-    print(f"\nTotal Questions: {total}")
-    if correct_total:
-        print(f"Accuracy (Keyword Match): {correct_count/correct_total:.2%}")
+def get_relation_type(question: str) -> str:
+    if "作词" in question:
+        return "作词"
+    elif "唱" in question or "歌手" in question:
+        return "歌手"
     else:
-        print("Accuracy (Keyword Match): N/A")
-    print(f"Hallucination Detection Rate: {hallucination_detected_count/total:.2%}")
-    print(f"KG Usage Rate: {kg_usage_count/total:.2%}")
-    print(f"Triple Cases: {triple_cases}")
-    print("Triple Extraction Metrics (Supported Relations Only):")
-    print(f"  Precision: {precision:.2%}")
-    print(f"  Recall: {recall:.2%}")
-    print(f"  F1 Score: {f1:.2%}")
+        return "其他"
 
+def evaluate():
+    total = len(TEST_CASES)
+    f1_total = 0.0
+    hits_at_1 = 0
+    hdr_numerator = 0
+    hdr_denominator = 0
+
+    error_stats = defaultdict(int)
+    relation_stats = {"歌手": {"p":0, "r":0, "f1":0, "count":0}, "作词": {"p":0, "r":0, "f1":0, "count":0}}
+
+    # 存储每条结果用于写入 CSV
+    results_rows = []
+
+    for test_case in TEST_CASES:
+        question = test_case["question"]
+        golden = test_case["golden_answer"]
+        llm_ans = test_case["llm_answer"]
+
+        # 调用你的系统
+        print(f"\n[评估中] 调用 query_handler 处理问题: {question}")
+        res = query_handler(question)
+        print(f"[评估中] 返回结果: {res}")
+        system_ans = res["data"] if res["state"] == 0 else []
+        final_str = ", ".join(system_ans)
+
+        # 判断是否匹配成功（模拟 handler 内部逻辑）
+        matched = any([
+            re.search(r"歌曲(.+)的作词人是", question),
+            re.search(r"(.+)是谁唱的", question),
+            re.search(r"谁唱的(.+)", question),
+            re.search(r"谁作词的(.+)", question),
+            re.search(r"(.+)是哪个专辑的", question),  # 新增专辑 pattern
+        ])
+
+        # Answer F1
+        f1 = answer_f1(final_str, golden)
+        f1_total += f1
+
+        # Hits@1
+        if system_ans and set(system_ans) & set(golden):
+            hits_at_1 += 1
+
+        # HDR
+        llm_correct = set(normalize_answer(llm_ans)) >= set([g.lower() for g in golden])
+        if not llm_correct:
+            hdr_denominator += 1
+            if set(system_ans) >= set(golden):
+                hdr_numerator += 1
+
+        # 错误分类
+        err_type = classify_error(question, golden, system_ans, matched)
+        error_stats[err_type] += 1
+
+        # 关系类型
+        rel = get_relation_type(question)
+        if rel in relation_stats:
+            relation_stats[rel]["count"] += 1
+            relation_stats[rel]["f1"] += f1
+
+        # 记录本条结果
+        results_rows.append({
+            "question": question,
+            "golden_answer": "; ".join(golden) if golden else "",
+            "llm_answer": llm_ans,
+            "system_answer": "; ".join(system_ans),
+            "f1_score": round(f1, 4),
+            "error_type": err_type,
+            "relation_type": rel
+        })
+
+    # 计算最终指标
+    avg_f1 = f1_total / total * 100
+    hits_at_1_rate = hits_at_1 / total * 100
+    hdr = hdr_numerator / hdr_denominator * 100 if hdr_denominator > 0 else 0.0
+
+    # 输出到控制台
+    print("\n📊 官方评估指标 (Academic Standard):")
+    print(f"   • Answer F1 Score : {avg_f1:6.2f}%")
+    print(f"   • KG Hits@1       : {hits_at_1_rate:6.2f}%")
+    print(f"   • Hallucination Correction Rate (HDR): {hdr:6.2f}%\n")
+
+    print("🔍 错误分析:")
+    for err, count in error_stats.items():
+        print(f"   • {err:20s}: {count} ({count/total*100:5.1f}%)")
+
+    print("\n📈 按关系类型表现:")
+    for rel, stat in relation_stats.items():
+        if stat["count"] > 0:
+            avg_rel_f1 = stat["f1"] / stat["count"] * 100
+            print(f"   • {rel:4s} F1: {avg_rel_f1:6.2f}% ({stat['count']} samples)")
+
+    # === 写入 CSV 文件 ===
+    output_file = "evaluation_results.csv"
+    with open(output_file, "w", encoding="utf-8-sig", newline="") as csvfile:
+        fieldnames = [
+            "question",
+            "golden_answer",
+            "llm_answer",
+            "system_answer",
+            "f1_score",
+            "error_type",
+            "relation_type"
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results_rows)
+
+        # 写入汇总行（可选）
+        writer.writerow({
+            "question": "=== SUMMARY ===",
+            "golden_answer": "",
+            "llm_answer": "",
+            "system_answer": "",
+            "f1_score": round(avg_f1 / 100, 4),
+            "error_type": f"F1={avg_f1:.2f}%, Hits@1={hits_at_1_rate:.2f}%, HDR={hdr:.2f}%",
+            "relation_type": ""
+        })
+
+    print(f"\n✅ 评估结果已保存至: {output_file}")
 
 if __name__ == "__main__":
-    results = []
-    print("Starting evaluation...")
-    for case in TEST_CASES:
-        try:
-            res = two_stage_qa(case["question"])
-            results.append({
-                "question": case["question"],
-                "keywords": case["keywords"],
-                "expected_triples": case["expected_triples"],
-                "result": res
-            })
-        except Exception as e:
-            print(f"Error processing {case['question']}: {e}")
-
-    calculate_metrics(results)
+    evaluate()
